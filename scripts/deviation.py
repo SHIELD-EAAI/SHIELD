@@ -9,17 +9,6 @@ import joblib
 import os
 import hashlib
 
-class FunctionTransformer(BaseEstimator, TransformerMixin):
-    def __init__(self, func, validate=True):
-        self.func = func
-        self.validate = validate
-    
-    def fit(self, X, y=None):
-        return self
-    
-    def transform(self, X):
-        return self.func(X)
-
 class DeviationAnalyzer:
     def __init__(self, dataset_name, file_name):
         self.dataset_name = dataset_name
@@ -35,6 +24,7 @@ class DeviationAnalyzer:
             'contamination': 0.1,
             'lof_neighbors': 20
         }
+        self.encoders = {}
         
     def _hash_uuid(self, uuid_str):
         if pd.isna(uuid_str) or uuid_str == '' or uuid_str is None:
@@ -53,23 +43,59 @@ class DeviationAnalyzer:
                 if n_unique <= self.config['max_categories']:
                     transformers.append(('onehot_' + feature, OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), [feature]))
                 else:
-                    transformers.append(('label_' + feature, LabelEncoder(), [feature]))
+                    transformers.append(('passthrough_' + feature, 'passthrough', [feature]))
         
         uuid_present = [f for f in uuid_features if f in df.columns]
-        if uuid_present:
-            uuid_pipeline = Pipeline([
-                ('hash', FunctionTransformer(
-                    lambda X: np.array([
-                        [self._hash_uuid(str(x)) for x in X[:, i]] 
-                        for i in range(X.shape[1])
-                    ]).T, 
-                    validate=False
-                )),
-                ('label', LabelEncoder())
-            ])
-            transformers.append(('uuid', uuid_pipeline, uuid_present))
-            
+        for uuid_col in uuid_present:
+            transformers.append(('passthrough_' + uuid_col, 'passthrough', [uuid_col]))
+                    
         return ColumnTransformer(transformers=transformers, remainder='drop')
+    
+    def _manual_encode_features(self, df, fit_encoders=True):
+        df_encoded = df.copy()
+        
+        categorical_features = ['event', 'processName', 'objectData']
+        uuid_features = ['processUUID', 'objectUUID']
+        
+        for feature in categorical_features:
+            if feature in df.columns:
+                n_unique = df[feature].nunique()
+                if n_unique > self.config['max_categories']:
+                    if fit_encoders:
+                        encoder = LabelEncoder()
+                        df_encoded[feature] = encoder.fit_transform(df_encoded[feature].astype(str))
+                        self.encoders[feature] = encoder
+                    else:
+                        encoder = self.encoders[feature]
+                        known_classes = set(encoder.classes_)
+                        df_encoded[feature] = df_encoded[feature].astype(str)
+                        df_encoded[feature] = df_encoded[feature].apply(
+                            lambda x: x if x in known_classes else 'unknown'
+                        )
+                        if 'unknown' not in known_classes:
+                            encoder.classes_ = np.append(encoder.classes_, 'unknown')
+                        df_encoded[feature] = encoder.transform(df_encoded[feature])
+        
+        for uuid_col in uuid_features:
+            if uuid_col in df.columns:
+                df_encoded[uuid_col] = df_encoded[uuid_col].apply(self._hash_uuid)
+                
+                if fit_encoders:
+                    encoder = LabelEncoder()
+                    df_encoded[uuid_col] = encoder.fit_transform(df_encoded[uuid_col].astype(str))
+                    self.encoders[uuid_col] = encoder
+                else:
+                    encoder = self.encoders[uuid_col]
+                    known_classes = set(encoder.classes_)
+                    df_encoded[uuid_col] = df_encoded[uuid_col].astype(str)
+                    df_encoded[uuid_col] = df_encoded[uuid_col].apply(
+                        lambda x: x if x in known_classes else 'unknown'
+                    )
+                    if 'unknown' not in known_classes:
+                        encoder.classes_ = np.append(encoder.classes_, 'unknown')
+                    df_encoded[uuid_col] = encoder.transform(df_encoded[uuid_col])
+        
+        return df_encoded
     
     def _prepare_data(self, df, fit_preprocessor=True):
         df = df.copy()
@@ -82,11 +108,13 @@ class DeviationAnalyzer:
         
         df = df.drop_duplicates(self.duplicate_features)
         
+        df_encoded = self._manual_encode_features(df, fit_encoders=fit_preprocessor)
+        
         if fit_preprocessor:
-            self.preprocessor = self._create_preprocessor(df)
-            X = self.preprocessor.fit_transform(df)
+            self.preprocessor = self._create_preprocessor(df_encoded)
+            X = self.preprocessor.fit_transform(df_encoded)
         else:
-            X = self.preprocessor.transform(df)
+            X = self.preprocessor.transform(df_encoded)
         
         return X
     
@@ -104,11 +132,13 @@ class DeviationAnalyzer:
         joblib.dump(model, os.path.join(self.directory_path, 'lof_model.joblib'))
         joblib.dump(scaler, os.path.join(self.directory_path, 'scaler.joblib'))
         joblib.dump(self.preprocessor, os.path.join(self.directory_path, 'preprocessor.joblib'))
+        joblib.dump(self.encoders, os.path.join(self.directory_path, 'encoders.joblib'))
     
     def load_model_and_mappers(self):
         model = joblib.load(os.path.join(self.directory_path, 'lof_model.joblib'))
         scaler = joblib.load(os.path.join(self.directory_path, 'scaler.joblib'))
         self.preprocessor = joblib.load(os.path.join(self.directory_path, 'preprocessor.joblib'))
+        self.encoders = joblib.load(os.path.join(self.directory_path, 'encoders.joblib'))
         return model, scaler
     
     def train(self):
