@@ -7,7 +7,7 @@ import community as community_louvain
 from datetime import datetime, date
 import pickle
 from collections import defaultdict
-from pyvis.network import Network # type: ignore
+from pyvis.network import Network
 import logging
 import statistics
 import json
@@ -21,39 +21,66 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class GraphProcessor:
-    def __init__(self, llm_analyzer):
-        self.RG = None
+    def __init__(self, llm_analyzer, graph_file='provenance_graph.gpickle'):
+        """
+        Initialize GraphProcessor
+        
+        Args:
+            llm_analyzer: LLM analyzer instance for attack detection
+            graph_file: Path to graph file (will be created if doesn't exist)
+        """
+        self.graph_file = graph_file
+        self.llm_analyzer = llm_analyzer
         self.grouper = UUIDGrouper()
         self.files_analyzed = 0
-        self.llm_analyzer = llm_analyzer
-        
-        self.primary_attack_sets = {}    # High priority attack sets
-        self.primary_set_metadata = {}   # Metadata for primary sets
-        
-        self.secondary_attack_sets = {}  # Medium priority attack sets  
-        self.secondary_set_metadata = {} # Metadata for secondary sets
-        
         self.attack_sets = {}
-        
+        self.high_conf_sets = {}
+        self.med_conf_sets = {}
         self.next_set_id = 0
         self.object_to_set_mapping = defaultdict(set)
         self.process_to_set_mapping = defaultdict(set)
         self.set_probability = defaultdict(float)
         self.set_count = defaultdict(int)
+        self.set_descriptions = {}  # Store LLM descriptions
+        
+        # Initialize or load the graph
+        self.initialize_graph()
+
+    def initialize_graph(self):
+        """Initialize the graph - load existing or create new"""
+        if os.path.exists(self.graph_file):
+            try:
+                self.load_reduced_graph(self.graph_file)
+                print(f"✓ Loaded existing graph from {self.graph_file}")
+            except Exception as e:
+                print(f"⚠️  Error loading graph: {e}")
+                print("Creating new graph...")
+                self.RG = nx.MultiDiGraph()
+        else:
+            print(f"No existing graph found. Creating new graph...")
+            self.RG = nx.MultiDiGraph()
 
     def load_reduced_graph(self, filename):
+        """Load graph from pickle file"""
         if os.path.exists(filename):
             with open(filename, 'rb') as f:
                 self.RG = pickle.load(f)
             print(f"Loaded graph with {len(self.RG.nodes())} nodes")
         else:
-            print(f"Graph file {filename} not found")
+            print(f"Graph file {filename} not found, creating new graph")
             self.RG = nx.MultiDiGraph()
 
-    def save_graph(self, filename):
-        with open(filename, 'wb') as f:
-            pickle.dump(self.RG, f)
-        print(f"Updated graph saved as {filename}")
+    def save_graph(self, filename=None):
+        """Save graph to pickle file"""
+        if filename is None:
+            filename = self.graph_file
+        
+        try:
+            with open(filename, 'wb') as f:
+                pickle.dump(self.RG, f)
+            print(f"✓ Graph saved to {filename} ({len(self.RG.nodes())} nodes)")
+        except Exception as e:
+            print(f"❌ Error saving graph: {e}")
 
     def count_tagged_nodes(self):
         return sum(1 for _, data in self.RG.nodes(data=True) if data.get('tagged_node') == 'yes')
@@ -70,11 +97,16 @@ class GraphProcessor:
         print(f"Percentage of tagged nodes: {tagged_percentage:.2f}%")
 
     def tag_reachable_nodes(self, start_node, value):
+        """Tag nodes reachable from start_node"""
+        if start_node not in self.RG.nodes():
+            print(f"⚠️  Start node {start_node} not in graph, skipping tagging")
+            return
+            
         reachable_nodes = set(nx.single_source_shortest_path_length(self.RG, start_node).keys())
         for node in reachable_nodes:
             if self.RG.nodes[node].get('tagged_node') != 'yes':
                 self.RG.nodes[node]['tagged_node'] = 'yes'
-            if self.RG.nodes[node].get('probability') < value:   
+            if self.RG.nodes[node].get('probability', 0) < value:   
                 self.RG.nodes[node]['probability'] = value
 
     def remove_untagged_nodes(self):
@@ -85,7 +117,7 @@ class GraphProcessor:
 
     def get_uuid_from_number(self, number, number_to_uuid):
         return number_to_uuid.get(number, None)
-
+    
     def extract_ip_ports(self, nodes):
         if not nodes:
             return []
@@ -116,7 +148,7 @@ class GraphProcessor:
                     else:
                         print(f"Could not map UUID {uuid_number}. Logic Error")
             except Exception as e:
-                print(node)
+                print(f"Error processing node {node}: {e}")
 
         logs_df = df[df['processUUID'].isin(procs)]
         return logs_df
@@ -162,6 +194,8 @@ class GraphProcessor:
             return number_to_uuid
         except Exception as e:
             print(f"Error in preprocess_file_data: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def find_communities(self, G):
@@ -185,15 +219,66 @@ class GraphProcessor:
         return suspicious_nodes
 
     def convert_timestamps(self, logs):
-        fmt = '%Y-%m-%d %H:%M:%S.%f'
-        start_time_str = logs[0].split(',')[-1].strip()[:-3]
-        start_time = datetime.strptime(start_time_str, fmt)
+        """Convert timestamps to elapsed time format, handling various timestamp formats"""
+        # Handle first timestamp
+        first_log = logs[0].split(',')[-1].strip()
+        
+        # Remove the last 3 chars (typically milliseconds precision adjustment)
+        if len(first_log) > 3:
+            start_time_str = first_log[:-3]
+        else:
+            start_time_str = first_log
+        
+        # Fix: Handle timestamps with trailing period but no microseconds
+        if start_time_str.endswith('.'):
+            start_time_str = start_time_str[:-1]  # Remove trailing period
+            fmt = '%Y-%m-%d %H:%M:%S'
+        else:
+            fmt = '%Y-%m-%d %H:%M:%S.%f'
+        
+        try:
+            start_time = datetime.strptime(start_time_str, fmt)
+        except ValueError as e:
+            # Fallback: try without microseconds
+            try:
+                if '.' in start_time_str:
+                    start_time_str = start_time_str.split('.')[0]
+                start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
+            except Exception as fallback_error:
+                print(f"Error parsing start time '{start_time_str}': {e}")
+                raise
+        
         new_logs = []
 
         for log in logs:
             parts = log.split(',')
-            timestamp_str = parts[-1].strip()[:-3]
-            timestamp = datetime.strptime(timestamp_str, fmt)
+            timestamp_str = parts[-1].strip()
+            
+            # Remove last 3 chars
+            if len(timestamp_str) > 3:
+                timestamp_str = timestamp_str[:-3]
+            
+            # Fix: Handle timestamps with trailing period but no microseconds
+            if timestamp_str.endswith('.'):
+                timestamp_str = timestamp_str[:-1]
+                timestamp_fmt = '%Y-%m-%d %H:%M:%S'
+            else:
+                timestamp_fmt = '%Y-%m-%d %H:%M:%S.%f'
+            
+            try:
+                timestamp = datetime.strptime(timestamp_str, timestamp_fmt)
+            except ValueError:
+                # Fallback: try without microseconds
+                try:
+                    if '.' in timestamp_str:
+                        timestamp_str = timestamp_str.split('.')[0]
+                    timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    # Last resort: keep original timestamp string
+                    new_log = ','.join(parts[:-1]) + ',' + timestamp_str
+                    new_logs.append(new_log)
+                    continue
+            
             elapsed_time = timestamp - start_time
             elapsed_seconds = elapsed_time.total_seconds()
             elapsed_formatted = "{:02}:{:02}:{:06.3f}".format(
@@ -230,116 +315,92 @@ class GraphProcessor:
             final_data = self.convert_timestamps(log_string)
             data_string = ';'.join(final_data) + ';'
         except Exception as e:
-            print(e)
+            print(f"Error in save_logs_to_file: {e}")
+            return None, {}
 
         return data_string, uuid_mappings
 
-    def categorize_set_by_confidence(self, set_id, probability):
-        """Categorize sets into primary/secondary queues based on confidence"""
-        if probability >= 0.8:
-            return "primary"
-        elif probability >= 0.7:
-            return "secondary"
-        else:
-            return "discard"  # Below threshold
-
-    def update_attack_set(self, set_id, new_set, probability=None):
-        """Update sets with proper categorization"""
-        if probability is None:
-            probability = self.calculate_set_probability(new_set)
-            
-        category = self.categorize_set_by_confidence(set_id, probability)
-        
-        if category == "primary":
-            self.primary_attack_sets[set_id] = new_set
-            self.primary_set_metadata[set_id] = {
-                'probability': probability,
-                'last_updated': datetime.now(),
-                'priority': 'HIGH',
-                'event_count': len(new_set)
-            }
-            # Remove from secondary if it was there
-            self.secondary_attack_sets.pop(set_id, None)
-            self.secondary_set_metadata.pop(set_id, None)
-            print(f"Set {set_id} added to PRIMARY QUEUE (confidence: {probability:.3f})")
-            
-        elif category == "secondary":
-            self.secondary_attack_sets[set_id] = new_set
-            self.secondary_set_metadata[set_id] = {
-                'probability': probability,
-                'last_updated': datetime.now(),
-                'priority': 'MEDIUM',
-                'event_count': len(new_set)
-            }
-            print(f"Set {set_id} added to SECONDARY QUEUE (confidence: {probability:.3f})")
-            
-        if category != "discard":
-            self.attack_sets[set_id] = new_set
-            self.set_probability[set_id] = probability
-            self.update_mappings(set_id, new_set)
-
-    def promote_set_to_primary(self, set_id, new_probability):
-        """Promote a set from secondary to primary queue"""
-        if set_id in self.secondary_attack_sets and new_probability >= 0.8:
-            set_data = self.secondary_attack_sets.pop(set_id)
-            self.secondary_set_metadata.pop(set_id)
-            
-            self.primary_attack_sets[set_id] = set_data
-            self.primary_set_metadata[set_id] = {
-                'probability': new_probability,
-                'last_updated': datetime.now(),
-                'priority': 'HIGH',
-                'event_count': len(set_data),
-                'promoted_from': 'secondary'
-            }
-            print(f"SET {set_id} PROMOTED TO PRIMARY QUEUE (confidence: {new_probability:.3f})")
-            return True
-        return False
-
     def process_file(self, file_path):
-        df = pd.read_csv(file_path)
-        if not df.empty:
+        """Process a single file"""
+        try:
+            df = pd.read_csv(file_path)
+            if df.empty:
+                print(f"⚠️  Empty file: {file_path}")
+                return
+                
             G = nx.DiGraph()
             number_to_uuid = self.preprocess_file_data(G, df)
             if number_to_uuid is None:
-                print(f"Error preprocessing file: {file_path}")
+                print(f"❌ Error preprocessing file: {file_path}")
                 return
-            print(f"Response for file: {os.path.basename(file_path)}")
+                
+            print(f"\n{'='*60}")
+            print(f"Processing: {os.path.basename(file_path)}")
+            print(f"{'='*60}")
+            
             suspicious_nodes = self.find_communities(G)
-            for community in suspicious_nodes:
+            
+            if not suspicious_nodes:
+                print(f"  No suspicious communities found")
+                return
+                
+            print(f"  Found {len(suspicious_nodes)} suspicious communities")
+            
+            for idx, community in enumerate(suspicious_nodes, 1):
+                print(f"\n  [Community {idx}/{len(suspicious_nodes)}]")
                 logs = self.get_suspicious_logs(df, community, number_to_uuid)
+                
+                if logs.empty:
+                    print(f"    ⚠️  No logs found")
+                    continue
+                    
                 data_string, mapping = self.save_logs_to_file(logs, file_path)
                 if data_string is None:
-                    print(f"No valid logs found in file: {file_path}")
+                    print(f"    ⚠️  Could not process logs")
                     continue
+                    
                 final_processes, result = self.llm_analyzer.main(data_string)
                 
-                if final_processes and float(result['analysis_probability'] >= 0.80):
+                if final_processes and result and float(result.get('analysis_probability', 0)) >= 0.80:
                     try:
-                        print(f" Got the results:  {final_processes}")
+                        print(f"    ✓ Attack processes identified: {final_processes}")
                         coherent = self.llm_analyzer.process_get_final_conclusion(data_string, final_processes)
                         coherent = json.loads(coherent)
                         value = float(coherent['probability_score'])
-                        print(f"Probability_Score: {value}")
+                        print(f"    ✓ Probability score: {value:.2f}")
+                        
                         if value >= 0.8:
-                            print(f"Final Result found: {result}")
+                            print(f"    ✓ High confidence attack detected!")
 
                         process_ids = coherent['process_uuids']
                         process_uuids = [mapping[int(key)] for key in process_ids]
-                        print(process_uuids)
+                        print(f"    ✓ Process UUIDs: {process_uuids}")
+                        
                         self.grouper.process_new_list(process_uuids, value)
                         
                         for process_uuid in process_uuids:
                             if process_uuid in self.RG.nodes():
                                 self.tag_reachable_nodes(process_uuid, value)
                             else:
-                                print(f"Process UUID {process_uuid} not found in the reduced graph")
+                                print(f"    ⚠️  Process UUID {process_uuid} not found in reduced graph")
+                                
                     except KeyError as e:
-                        print(f"KeyError encountered: {e}")
-        
-        self.files_analyzed += 1
-        if self.files_analyzed % 9 == 0:
-            self.save_graph("provenance_graph.gpickle")
+                        print(f"    ❌ KeyError: {e}")
+                    except json.JSONDecodeError as e:
+                        print(f"    ❌ JSON decode error: {e}")
+                    except Exception as e:
+                        print(f"    ❌ Error: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            self.files_analyzed += 1
+            if self.files_analyzed % 9 == 0:
+                self.save_graph()
+                
+        except Exception as e:
+            print(f"❌ Error processing file {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
 
     def get_node_info(self):
         return self.grouper.get_node_info(self.RG)
@@ -347,6 +408,9 @@ class GraphProcessor:
     def filter_nodes_by_type(self, nodes):
         filtered_nodes = []
         for node in nodes:
+            if node not in self.RG.nodes():
+                continue
+                
             node_data = self.RG.nodes[node]
             node_type = node_data.get('node_type')
             
@@ -359,41 +423,62 @@ class GraphProcessor:
         return filtered_nodes
 
     def analyze_directory(self, directory_path):
+        """Analyze all files in directory"""
+        print(f"\n{'='*60}")
+        print(f"ANALYZING DIRECTORY: {directory_path}")
+        print(f"{'='*60}")
+        
         pattern = r'processed_file_sliding_window_from_(\d{4}-\d{2}-\d{2})-01-00_to_\1-01-30'
         current_date = None
 
+        csv_files = []
         for root, dirs, files in os.walk(directory_path):
             for file in files:
-                match = re.match(pattern, file)
-                if match:
-                    file_date = datetime.strptime(match.group(1), '%Y-%m-%d').date()
-                    
-                    if file_date != current_date:
-                        self.perform_day_start_action(file_date)
-                        current_date = file_date
-                        
-                file_path = os.path.join(root, file)
-                self.process_file(file_path)
-                results = self.analyze() 
-                if results is not None:
-                    for result in results:   
-                        print(f"Set {result['set_id']} changed:")
-                        print(f"Priority: {result.get('priority', 'UNKNOWN')}")
-                        print(f"Queue: {result.get('queue', 'legacy')}")
-                        print(f"Confidence: {result.get('confidence', 'N/A')}")
-                        print(f"Description: {result['description']}")
-                        print(f"Set data: {result['set_data']}")
-                        print("---")
+                if file.endswith('.csv'):
+                    csv_files.append(os.path.join(root, file))
+        
+        if not csv_files:
+            print(f"⚠️  No CSV files found in {directory_path}")
+            return
+            
+        print(f"Found {len(csv_files)} files to process\n")
+        
+        for idx, file_path in enumerate(csv_files, 1):
+            print(f"\n[{idx}/{len(csv_files)}] Processing: {os.path.basename(file_path)}")
+            
+            file = os.path.basename(file_path)
+            match = re.match(pattern, file)
+            if match:
+                file_date = datetime.strptime(match.group(1), '%Y-%m-%d').date()
+                
+                if file_date != current_date:
+                    self.perform_day_start_action(file_date)
+                    current_date = file_date
+            
+            self.process_file(file_path)
+            
+            # Check for analysis results
+            results = self.analyze()
+            if results is not None:
+                for result in results:   
+                    print(f"\n{'='*60}")
+                    print(f"ATTACK DETECTED - Set {result['set_id']}")
+                    print(f"{'='*60}")
+                    print(f"Description: {result['description']}")
+                    print(f"Set data: {len(result['set_data'])} events")
+                    print("="*60)
 
     def perform_day_start_action(self, input_date):
-        print(f"Performing action for the start of day: {input_date}")
+        print(f"\n{'='*60}")
+        print(f"DAY ROLLOVER: {input_date}")
+        print(f"{'='*60}")
 
         if isinstance(input_date, str):
             input_date = datetime.strptime(input_date, '%Y-%m-%d').date()
         elif isinstance(input_date, datetime):
             input_date = input_date.date()
         elif not isinstance(input_date, date):
-            raise ValueError("Invalid date format. Expected string, datetime, or date object.")
+            raise ValueError("Invalid date format")
 
         edges_to_remove = []
         for u, v, key, data in self.RG.edges(data=True, keys=True):
@@ -408,9 +493,8 @@ class GraphProcessor:
         isolated_nodes = list(nx.isolates(self.RG))
         self.RG.remove_nodes_from(isolated_nodes)
 
-        print(f"Removed {len(edges_to_remove)} edges and {len(isolated_nodes)} isolated nodes")
-
-        self.save_graph("provenance_graph.gpickle")
+        print(f"Cleaned {len(edges_to_remove)} old edges and {len(isolated_nodes)} isolated nodes")
+        self.save_graph()
 
     def extract_date(self, timestamp):
         if timestamp == 'None' or timestamp is None:
@@ -423,85 +507,34 @@ class GraphProcessor:
     def get_tagged_nodes(self):
         return [node for node, data in self.RG.nodes(data=True) if data.get('tagged_node') == 'yes']
 
-    def get_primary_sets(self):
-        """Get all high-confidence attack sets"""
-        return {
-            'sets': self.primary_attack_sets,
-            'metadata': self.primary_set_metadata,
-            'count': len(self.primary_attack_sets)
-        }
-
-    def get_secondary_sets(self):
-        """Get all medium-confidence attack sets"""
-        return {
-            'sets': self.secondary_attack_sets,
-            'metadata': self.secondary_set_metadata,
-            'count': len(self.secondary_attack_sets)
-        }
-
-    def print_queue_status(self):
-        """Print status of both queues"""
-        print("=" * 60)
-        print(f"PRIMARY QUEUE (≥0.8):   {len(self.primary_attack_sets)} sets")
-        print(f"SECONDARY QUEUE (0.7-0.79): {len(self.secondary_attack_sets)} sets")
-        print(f"TOTAL ACTIVE SETS:      {len(self.attack_sets)} sets")
-        print("=" * 60)
-        
-        # Show top priority items
-        if self.primary_attack_sets:
-            print("PRIMARY QUEUE ITEMS:")
-            for set_id, metadata in list(self.primary_set_metadata.items())[:3]:
-                print(f"   Set {set_id}: {metadata['probability']:.3f} confidence, {metadata['event_count']} events")
-        
-        if self.secondary_attack_sets:
-            print("SECONDARY QUEUE ITEMS:")
-            for set_id, metadata in list(self.secondary_set_metadata.items())[:3]:
-                print(f"   Set {set_id}: {metadata['probability']:.3f} confidence, {metadata['event_count']} events")
-
-    def process_priority_queue(self):
-        """Process primary queue first, then secondary"""
-        results = []
-
-        print("PROCESSING PRIMARY QUEUE (High Confidence ≥ 0.8)")
-        for set_id, events in self.primary_attack_sets.items():
-            metadata = self.primary_set_metadata[set_id]
-            sorted_events = self.sort_events_by_time(events)
+    def analyze(self):
+        """Analyze current state and return changed attack sets"""
+        if self.RG is None or len(self.RG.nodes()) == 0:
+            return None
             
-            result = self.llm_analyzer.process_get_result_from_llm(sorted_events)
-            if result["is_coherent_attack"]:
-                results.append({
-                    "set_id": set_id,
-                    "priority": "HIGH",
-                    "confidence": metadata['probability'],
-                    "description": result["description"],
-                    "set_data": sorted_events,
-                    "queue": "primary"
-                })
-        
-        print("PROCESSING SECONDARY QUEUE (Medium Confidence 0.7-0.79)")
-        for set_id, events in self.secondary_attack_sets.items():
-            metadata = self.secondary_set_metadata[set_id]
-            sorted_events = self.sort_events_by_time(events)
-            
-            result = self.llm_analyzer.process_get_result_from_llm(sorted_events)
-            if result["is_coherent_attack"]:
-                new_confidence = result.get("probability_score", metadata['probability'])
-                if new_confidence >= 0.8:
-                    self.promote_set_to_primary(set_id, new_confidence)
-                
-                results.append({
-                    "set_id": set_id,
-                    "priority": "MEDIUM",
-                    "confidence": metadata['probability'],
-                    "description": result["description"],
-                    "set_data": sorted_events,
-                    "queue": "secondary"
-                })
-        
-        return results
+        results = self.grouper.get_groups(self.RG)
+        if not results:
+            return None
 
-    def sort_events_by_time(self, events):
-        """Helper method to sort events by timestamp"""
+        result_sets = self.trace_and_group_sets(results)
+        
+        if not result_sets:
+            return None
+            
+        current_sets = self.get_sorted_sets_with_node_info(result_sets)
+
+        changed_sets = {}
+        for current_set in current_sets:
+            set_id = self.find_or_create_set(current_set)
+            if self.is_set_changed(set_id, current_set):
+                changed_sets[set_id] = self.merge_with_existing_set(set_id, current_set)
+                self.update_attack_set(set_id, changed_sets[set_id])
+        
+        if not changed_sets:
+            return None
+        
+        self.merge_related_sets()
+        
         def sort_key(tup):
             timestamp = tup[3]
             if timestamp == 'None':
@@ -510,49 +543,29 @@ class GraphProcessor:
                 return datetime.strptime(timestamp[:26], '%Y-%m-%d %H:%M:%S.%f')
             except ValueError:
                 return datetime.max
-        return sorted(events, key=sort_key)
 
-    def calculate_set_probability(self, events):
-        """Calculate probability from event data"""
-        probabilities = []
-        for event in events:
-            if len(event) > 4 and event[4] != 'None':
-                try:
-                    probabilities.append(float(event[4]))
-                except (ValueError, TypeError):
-                    continue
-        
-        return max(probabilities) if probabilities else 0.0
-
-    def analyze(self):
-        """Modified analyze method to use dual queue system"""
-        results = self.grouper.get_groups(self.RG)
-        if not results:
-            return None
-
-        result_sets = self.trace_and_group_sets(results)
-        current_sets = self.get_sorted_sets_with_node_info(result_sets)
-
-        changed_sets = {}
-        for current_set in current_sets:
-            set_id = self.find_or_create_set(current_set)
-            if self.is_set_changed(set_id, current_set):
-                merged_set = self.merge_with_existing_set(set_id, current_set)
+        final_results = []
+        for set_id, changed_set in changed_sets.items():
+            if self.set_probability.get(set_id, 0) < 0.7:
+                continue
                 
-                # Calculate confidence from events
-                probability = self.calculate_set_probability(merged_set)
+            sorted_set = sorted(changed_set, key=sort_key)
+            
+            try:
+                result = self.llm_analyzer.process_get_result_from_llm(sorted_set)
+                result = json.loads(result) if isinstance(result, str) else result
                 
-                # Update with proper categorization
-                self.update_attack_set(set_id, merged_set, probability)
-                changed_sets[set_id] = merged_set
+                if result.get("is_coherent_attack") and result.get("probability_score", 0) >= 0.7:
+                    final_results.append({
+                        "set_id": set_id,
+                        "description": result["description"],
+                        "set_data": sorted_set,
+                    })
+            except Exception as e:
+                print(f"Error analyzing set {set_id}: {e}")
+                continue
         
-        if not changed_sets:
-            return None
-        
-        self.merge_related_sets()
-        self.print_queue_status()
-        
-        return self.process_priority_queue()
+        return final_results if final_results else None
 
     def find_or_create_set(self, current_set):
         for event in current_set:
@@ -566,35 +579,24 @@ class GraphProcessor:
         return new_set_id
 
     def is_set_changed(self, set_id, current_set):
-        existing_set = None
-        if set_id in self.primary_attack_sets:
-            existing_set = self.primary_attack_sets[set_id]
-        elif set_id in self.secondary_attack_sets:
-            existing_set = self.secondary_attack_sets[set_id]
-        elif set_id in self.attack_sets:  # Legacy check
-            existing_set = self.attack_sets[set_id]
-            
-        if existing_set is None:
+        if set_id not in self.attack_sets:
             return True
+        existing_set = self.attack_sets[set_id]
         return any(event not in existing_set for event in current_set)
 
     def merge_with_existing_set(self, set_id, current_set):
-        existing_set = None
-        if set_id in self.primary_attack_sets:
-            existing_set = self.primary_attack_sets[set_id]
-        elif set_id in self.secondary_attack_sets:
-            existing_set = self.secondary_attack_sets[set_id]
-        elif set_id in self.attack_sets:  # Legacy
-            existing_set = self.attack_sets[set_id]
-            
-        if existing_set is None:
+        if set_id not in self.attack_sets:
             return current_set
-            
-        merged_set = existing_set[:]  # Create a copy of the existing set
+        existing_set = self.attack_sets[set_id]
+        merged_set = existing_set[:]
         for event in current_set:
             if event not in merged_set:
                 merged_set.append(event)
         return merged_set
+
+    def update_attack_set(self, set_id, new_set):
+        self.attack_sets[set_id] = new_set
+        self.update_mappings(set_id, new_set)
 
     def update_mappings(self, set_id, events):
         for event in events:
@@ -617,27 +619,12 @@ class GraphProcessor:
                 if len(merge_set_ids) > 1:
                     merged = True
                     all_events = []
-                    max_probability = 0.0
-                    
                     for set_id in merge_set_ids:
-                        if set_id in self.primary_attack_sets:
-                            all_events.extend(self.primary_attack_sets[set_id])
-                            max_probability = max(max_probability, self.primary_set_metadata[set_id]['probability'])
-                            if set_id != target_set_id:
-                                del self.primary_attack_sets[set_id]
-                                del self.primary_set_metadata[set_id]
-                        elif set_id in self.secondary_attack_sets:
-                            all_events.extend(self.secondary_attack_sets[set_id])
-                            max_probability = max(max_probability, self.secondary_set_metadata[set_id]['probability'])
-                            if set_id != target_set_id:
-                                del self.secondary_attack_sets[set_id]
-                                del self.secondary_set_metadata[set_id]
-                        elif set_id in self.attack_sets:  # Legacy
-                            all_events.extend(self.attack_sets[set_id])
-                            if set_id != target_set_id:
-                                del self.attack_sets[set_id]
+                        all_events.extend(self.attack_sets[set_id])
+                        if set_id != target_set_id:
+                            del self.attack_sets[set_id]
                     
-                    self.update_attack_set(target_set_id, all_events, max_probability)
+                    self.attack_sets[target_set_id] = all_events
                     
                     for mapping in [self.object_to_set_mapping, self.process_to_set_mapping]:
                         for key, set_ids in list(mapping.items()):
@@ -645,36 +632,41 @@ class GraphProcessor:
                                 mapping[key] = {target_set_id}
 
     def print_sets(self, threshold=0.80):
-        """Print sets from both queues above threshold"""
-        print(f"\n PRIMARY QUEUE SETS (≥{threshold}):")
-        for set_id, events in self.primary_attack_sets.items():
-            metadata = self.primary_set_metadata[set_id]
-            probability = metadata['probability']
+        print(f"\n{'='*60}")
+        print(f"ATTACK SETS (threshold >= {threshold})")
+        print(f"{'='*60}")
+        
+        if not self.attack_sets:
+            print("No attack sets found.")
+            return
+        
+        for set_id, events in self.attack_sets.items():
+            probability = self.set_probability.get(set_id, 0.0)
+            if probability == 0.0 and events:
+                try:
+                    probability = min(float(event[4]) for event in events if event[4] != 'None')
+                except (ValueError, TypeError):
+                    probability = 0.0
+                    
             if probability >= threshold:
-                print(f"Set {set_id} (PRIMARY - {probability:.3f}):")
-                sorted_events = sorted(events, key=lambda x: datetime.max if x[3] == 'None' else datetime.strptime(x[3][:26], '%Y-%m-%d %H:%M:%S.%f'))
+                print(f"\nSet {set_id} (probability: {probability:.2f}):")
+                sorted_events = sorted(
+                    events, 
+                    key=lambda x: datetime.max if x[3] == 'None' else datetime.strptime(x[3][:26], '%Y-%m-%d %H:%M:%S.%f')
+                )
                 for event in sorted_events:
                     print(f"  {event}")
                 print()
 
-        print(f"\n SECONDARY QUEUE SETS (≥{threshold}):")
-        for set_id, events in self.secondary_attack_sets.items():
-            metadata = self.secondary_set_metadata[set_id]
-            probability = metadata['probability']
-            if probability >= threshold:
-                print(f"Set {set_id} (SECONDARY - {probability:.3f}):")
-                sorted_events = sorted(events, key=lambda x: datetime.max if x[3] == 'None' else datetime.strptime(x[3][:26], '%Y-%m-%d %H:%M:%S.%f'))
-                for event in sorted_events:
-                    print(f"  {event}")
-                print()
-	
     def trace_and_group_sets(self, initial_sets):
-
-        all_nodes = set.union(*initial_sets)
+        all_nodes = set.union(*initial_sets) if initial_sets else set()
+        
+        if not all_nodes:
+            return []
         
         missing_nodes = all_nodes - set(self.RG.nodes())
         if missing_nodes:
-            logger.warning(f"Found {len(missing_nodes)} nodes in initial_sets that are not in RG: {missing_nodes}")
+            logger.warning(f"Found {len(missing_nodes)} nodes not in RG: {list(missing_nodes)[:5]}...")
         
         new_sets = []
         processed_nodes = set()
@@ -722,14 +714,29 @@ class GraphProcessor:
 
             unique_tuples = set()
             for node in result_set:
+                if node not in self.RG.nodes():
+                    continue
+                    
                 outgoing_edges = self.RG.out_edges(node, keys=True, data=True)
                 incoming_edges = self.RG.in_edges(node, keys=True, data=True)
 
                 for edge in outgoing_edges:
-                    unique_tuples.add((self.RG.nodes[edge[0]].get('label', 'Unknown'), edge[2], self.RG.nodes[edge[1]].get('label', 'Unknown'), edge[3].get('time', 'None'), self.RG.nodes[node].get('probability', 'None')))
+                    unique_tuples.add((
+                        self.RG.nodes[edge[0]].get('label', 'Unknown'),
+                        edge[2],
+                        self.RG.nodes[edge[1]].get('label', 'Unknown'),
+                        edge[3].get('time', 'None'),
+                        self.RG.nodes[node].get('probability', 'None')
+                    ))
 
                 for edge in incoming_edges:
-                    unique_tuples.add((self.RG.nodes[edge[1]].get('label', 'Unknown'), edge[2], self.RG.nodes[edge[0]].get('label', 'Unknown'), edge[3].get('time', 'None'), self.RG.nodes[node].get('probability', 'None')))
+                    unique_tuples.add((
+                        self.RG.nodes[edge[1]].get('label', 'Unknown'),
+                        edge[2],
+                        self.RG.nodes[edge[0]].get('label', 'Unknown'),
+                        edge[3].get('time', 'None'),
+                        self.RG.nodes[node].get('probability', 'None')
+                    ))
 
             grouped_tuples = defaultdict(list)
             for tup in unique_tuples:
@@ -756,17 +763,138 @@ class GraphProcessor:
         return sorted_sets
     
     def finalize(self):
-        print("Finalizing analysis...")
+        """Finalize analysis with final LLM validation of all attack sets"""
+        print(f"\n{'='*60}")
+        print("FINALIZING ANALYSIS")
+        print(f"{'='*60}")
 
+        # Print initial sets
         self.print_sets()
-
+        
+        # Perform final LLM validation on all attack sets
+        if self.attack_sets:
+            print(f"\n{'='*60}")
+            print("FINAL LLM VALIDATION")
+            print(f"{'='*60}")
+            
+            validated_attacks = []
+            
+            for set_id, events in self.attack_sets.items():
+                probability = self.set_probability.get(set_id, 0.0)
+                
+                # Calculate probability from events if not set
+                if probability == 0.0 and events:
+                    try:
+                        probability = min(float(event[4]) for event in events if event[4] != 'None')
+                        self.set_probability[set_id] = probability
+                    except (ValueError, TypeError):
+                        probability = 0.0
+                
+                # Skip low probability sets
+                if probability < 0.7:
+                    print(f"\n⚠️  Set {set_id} (probability: {probability:.2f}) - Skipped (below threshold)")
+                    continue
+                
+                print(f"\n{'='*50}")
+                print(f"📊 Analyzing Set {set_id}")
+                print(f"{'='*50}")
+                print(f"  Initial probability: {probability:.2f}")
+                print(f"  Number of events: {len(events)}")
+                
+                # Sort events by timestamp
+                def sort_key(tup):
+                    timestamp = tup[3]
+                    if timestamp == 'None':
+                        return datetime.max
+                    try:
+                        return datetime.strptime(timestamp[:26], '%Y-%m-%d %H:%M:%S.%f')
+                    except ValueError:
+                        return datetime.max
+                
+                sorted_events = sorted(events, key=sort_key)
+                
+                try:
+                    # Call LLM for final analysis
+                    print(f"  Sending to LLM for validation...")
+                    result = self.llm_analyzer.process_get_result_from_llm(sorted_events)
+                    result = json.loads(result) if isinstance(result, str) else result
+                    
+                    is_coherent = result.get("is_coherent_attack", False)
+                    description = result.get("description", "No description provided")
+                    final_probability = result.get("probability_score", 0.0)
+                    
+                    print(f"\n  📋 LLM Analysis Results:")
+                    print(f"  {'─'*45}")
+                    print(f"  ✓ Coherent Attack: {is_coherent}")
+                    print(f"  ✓ Final Probability: {final_probability:.2f}")
+                    print(f"  ✓ Description:")
+                    # Wrap description text
+                    desc_lines = description.split('. ')
+                    for line in desc_lines:
+                        if line:
+                            print(f"     {line.strip()}{'.' if not line.endswith('.') else ''}")
+                    
+                    # Update probability with LLM's assessment
+                    self.set_probability[set_id] = final_probability
+                    self.set_descriptions[set_id] = description
+                    
+                    if is_coherent and final_probability >= 0.7:
+                        print(f"\n  🚨 CONFIRMED ATTACK - Set {set_id}")
+                        validated_attacks.append({
+                            'set_id': set_id,
+                            'probability': final_probability,
+                            'description': description,
+                            'events': sorted_events
+                        })
+                    else:
+                        print(f"\n  ℹ️  Set {set_id} does not form coherent attack")
+                        
+                except json.JSONDecodeError as e:
+                    print(f"\n  ❌ JSON decode error: {e}")
+                    print(f"     Raw response: {str(result)[:200]}...")
+                except Exception as e:
+                    print(f"\n  ❌ Error analyzing set {set_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Print final summary
+            print(f"\n{'='*60}")
+            print("FINAL ATTACK SUMMARY")
+            print(f"{'='*60}")
+            
+            if validated_attacks:
+                print(f"\n🚨 {len(validated_attacks)} CONFIRMED ATTACK(S) DETECTED:\n")
+                
+                for attack in sorted(validated_attacks, key=lambda x: x['probability'], reverse=True):
+                    print(f"Set {attack['set_id']}:")
+                    print(f"  Confidence: {attack['probability']:.2%}")
+                    print(f"  Events: {len(attack['events'])}")
+                    print(f"  Description: {attack['description'][:150]}...")
+                    print()
+                
+                # Save validated attacks to file
+                try:
+                    with open('validated_attacks.json', 'w') as f:
+                        json.dump(validated_attacks, f, indent=2, default=str)
+                    print(f"✓ Saved validated attacks to validated_attacks.json")
+                except Exception as e:
+                    print(f"⚠️  Could not save validated attacks: {e}")
+            else:
+                print("\n✓ No coherent attacks validated by final LLM analysis")
+            
+            print(f"{'='*60}\n")
+        
+        # Rest of finalize
         self.remove_untagged_nodes()
-        self.save_graph("provenance_graph.gpickle")
+        self.save_graph()
 
-        net = Network(notebook=False, cdn_resources='remote')
-        net.from_nx(self.RG)
-        net.save_graph("graph_visualization.html")
-
+        try:
+            net = Network(notebook=False, cdn_resources='remote')
+            net.from_nx(self.RG)
+            net.save_graph("graph_visualization.html")
+            print("✓ Saved graph visualization to graph_visualization.html")
+        except Exception as e:
+            print(f"⚠️  Could not create visualization: {e}")
 
 class UUIDGrouper:
     def __init__(self):
@@ -783,7 +911,6 @@ class UUIDGrouper:
         
         if matched_indices:
             merged_set = set.union(new_set, *[self.uuid_sets[i] for i in matched_indices])
-            
             max_probability = max([probability_value] + [self.set_probabilities[i] for i in matched_indices])
             
             for i in sorted(matched_indices, reverse=True):
@@ -798,8 +925,13 @@ class UUIDGrouper:
 
     def synchronize_with_graph(self, graph):
         """Remove nodes that are no longer in the graph."""
+        if graph is None:
+            logger.warning("Graph is None in synchronize_with_graph")
+            return set()
+            
         nodes_in_graph = set(graph.nodes())
         removed_nodes = set()
+        
         for i, uuid_set in enumerate(self.uuid_sets):
             nodes_to_remove = uuid_set - nodes_in_graph
             uuid_set.difference_update(nodes_to_remove)
@@ -809,14 +941,15 @@ class UUIDGrouper:
         self.set_probabilities = [p for s, p in zip(self.uuid_sets, self.set_probabilities) if s]
         
         if removed_nodes:
-            logger.info(f"Removed {len(removed_nodes)} nodes from UUIDGrouper that are no longer in the graph.")
+            logger.info(f"Removed {len(removed_nodes)} nodes from UUIDGrouper")
         return removed_nodes
 
     def get_groups(self, graph):
-        """
-        Return the sets with nodes that exist in the current graph, 
-        along with their probabilities, filtered by a probability threshold.
-        """
+        """Return sets with nodes that exist in the current graph"""
+        if graph is None:
+            logger.warning("Graph is None in get_groups")
+            return []
+            
         self.synchronize_with_graph(graph)
         groups = []
         
@@ -827,6 +960,9 @@ class UUIDGrouper:
         return groups
 
     def get_node_info(self, graph):
+        if graph is None:
+            return []
+            
         node_info = []
         for i, (uuid_set, probability) in enumerate(zip(self.uuid_sets, self.set_probabilities), 1):
             set_info = {f"Set {i}": []}
@@ -836,6 +972,6 @@ class UUIDGrouper:
                     node_data['probability'] = probability
                     set_info[f"Set {i}"].append({uuid: node_data})
                 else:
-                    set_info[f"Set {i}"].append({uuid: {"info": "Node not found in graph", "probability": probability}})
+                    set_info[f"Set {i}"].append({uuid: {"info": "Node not found", "probability": probability}})
             node_info.append(set_info)
         return node_info
